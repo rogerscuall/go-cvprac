@@ -31,47 +31,31 @@
 package main
 
 import (
+	"fmt"
 	"log"
 
-	"gopkg.in/aristanetworks/go-cvprac.v2/client"
+	"github.com/aristanetworks/go-cvprac/v3/client"
 )
 
 func main() {
-	hosts := []string{"10.16.129.98"}
+	TokenCvp := "cvp token goes here"
+	hosts := []string{"10.20.30.186"}
 	cvpClient, _ := client.NewCvpClient(
 		client.Protocol("https"),
 		client.Port(443),
 		client.Hosts(hosts...),
-		client.Debug(true))
+		client.Debug(false))
 
-	if err := cvpClient.Connect("cvpadmin", "cvp123"); err != nil {
+	if err := cvpClient.ConnectWithToken(TokenCvp); err != nil {
 		log.Fatalf("ERROR: %s", err)
 	}
 
-	mac := "04:47:cf:b3:2e:2b"
-	destContainer := "Leafs"
-
-	log.Printf("Getting device: %s", mac)
-	dev, err := cvpClient.API.GetDeviceByID(mac)
+	// Find out the cvp info
+	data, err := cvpClient.API.GetCvpInfo()
 	if err != nil {
-		log.Fatalf("Failed to Get Device: %s", err)
+		log.Fatalf("ERROR: %s", err)
 	}
-
-	log.Printf("Getting Container: %s", destContainer)
-	container, err := cvpClient.API.GetContainerByName(destContainer)
-	if err != nil {
-		log.Fatalf("Failed to Get Container: %s", err)
-	}
-
-	log.Printf("Getting Configlet: [Auto Execute TaskLEAF-1A_mgmt]")
-	configlet, err := cvpClient.API.GetConfigletByName("Auto Execute TaskLEAF-1A_mgmt")
-	if err != nil {
-		log.Fatalf("Failed to Get Configlet: %s", err)
-	}
-
-	taskInfo, err := cvpClient.API.DeployDevice("TEST", dev, "192.168.0.7", container, *configlet)
-	if err != nil {
-		log.Fatalf("Failed to Deploy device: %s", err)
-	}
-	log.Printf("TaskInfo: %v", taskInfo)
+	fmt.Printf("Data: %v\n", data)
+	// Should return the following when using 2021.2.0 for example.
+	// Data: version:2021.2.0, appVersion:
 }

@@ -41,8 +41,8 @@ import (
 
 	"github.com/pkg/errors"
 
-	cvprac "github.com/aristanetworks/go-cvprac"
-	cvpapi "github.com/aristanetworks/go-cvprac/api"
+	cvprac "github.com/aristanetworks/go-cvprac/v3"
+	cvpapi "github.com/aristanetworks/go-cvprac/v3/api"
 
 	"net/http"
 
@@ -77,20 +77,21 @@ type authInfo struct {
 // CvpClient represents a CVP client api connection
 type CvpClient struct {
 	cvpapi.ClientInterface
-	Hosts     []string
-	HostPool  *HostIterator
-	Port      int
-	Protocol  string
-	authInfo  *authInfo
-	Timeout   time.Duration
-	Transport http.RoundTripper
-	Client    *resty.Client
-	SessID    string
-	url       string
-	API       *cvpapi.CvpRestAPI
-	Debug     bool
-	IsCvaas   bool
-	Tenant    string
+	Hosts          []string
+	HostPool       *HostIterator
+	Port           int
+	Protocol       string
+	authInfo       *authInfo
+	Timeout        time.Duration
+	Transport      http.RoundTripper
+	Client         *resty.Client
+	SessID         string
+	urlPrefixShort string
+	API            *cvpapi.CvpRestAPI
+	Debug          bool
+	IsCvaas        bool
+	Tenant         string
+	Token          string
 }
 
 // Option is a Client Option...function that sets a value and returns
@@ -278,6 +279,12 @@ func (c *CvpClient) Connect(username string, password string) error {
 	return c.createSession(true)
 }
 
+// Connect to CVP with a token. Takes the cvpToken parameter as an input for the string.
+func (c *CvpClient) ConnectWithToken(cvpToken string) error {
+	c.Token = cvpToken
+	return c.createSession(true)
+}
+
 func (c *CvpClient) createSession(allNodes bool) error {
 	var errorMsg []string
 
@@ -305,10 +312,7 @@ func (c *CvpClient) initSession(host string) error {
 		return errors.Errorf("initSession: No host provided")
 	}
 
-	c.url = fmt.Sprintf("%s://%s:%d", c.Protocol, host, c.GetPort())
-	if !c.IsCvaas {
-		c.url = c.url + "/web"
-	}
+	c.urlPrefixShort = fmt.Sprintf("%s://%s:%d", c.Protocol, host, c.GetPort())
 
 	c.Client = resty.New()
 
@@ -319,7 +323,11 @@ func (c *CvpClient) initSession(host string) error {
 	if c.Protocol == "https" {
 		c.Client.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
 	}
-	c.Client.SetHostURL(c.url)
+	// If there is a token with the TokenField then set token within the rest library.
+	if c.Token != "" {
+		c.Client.SetAuthToken(c.Token)
+	}
+
 	c.Client.SetHeaders(headers)
 	c.Client.SetTimeout(c.Timeout)
 	c.Client.SetDebug(c.Debug)
@@ -339,17 +347,28 @@ func (c *CvpClient) resetSession() error {
 }
 
 func (c *CvpClient) login() error {
+	// If a token exists do not use one of the logincvaas or loginonprem
+	// and do not create a cookie the auth header is used with the token.
+	if c.Token != "" {
+		return nil
+	}
 	if c.IsCvaas {
 		return c.loginCvaas()
 	}
-	return c.loginOnPrem()
+	if c.authInfo.Username != "" {
+		return c.loginOnPrem()
+	} else {
+		return nil
+	}
 }
 
 func (c *CvpClient) loginCvaas() error {
 	request := c.Client.R()
 	auth := `{"org":"` + c.Tenant + `", "name":"` + c.authInfo.Username +
 		`", "password":"` + c.authInfo.Password + `"}`
-	resp, err := request.SetBody(auth).Post("/api/v1/oauth?provider=local&next=false")
+
+	resp, err := request.SetBody(auth).Post(c.urlPrefixShort +
+		"/api/v1/oauth?provider=local&next=false")
 	if err != nil {
 		return errors.Wrap(err, "login")
 	}
@@ -371,7 +390,7 @@ func (c *CvpClient) loginOnPrem() error {
 	auth := "{\"userId\":\"" + c.authInfo.Username +
 		"\", \"password\":\"" + c.authInfo.Password + "\"}"
 
-	resp, err := request.SetBody(auth).Post("/login/authenticate.do")
+	resp, err := request.SetBody(auth).Post(c.urlPrefixShort + "/web/login/authenticate.do")
 	if err != nil {
 		return errors.Wrap(err, "login")
 	}
@@ -397,7 +416,20 @@ func (c *CvpClient) makeRequest(reqType string, url string, params *url.Values,
 	var formattedParams map[string]string
 
 	if c.Client == nil {
-		return nil, errors.Errorf("makeRequest: No valid session to CVP [%s]", c.url)
+		return nil, errors.Errorf("makeRequest: No valid session to CVP [%s]",
+			c.urlPrefixShort)
+	}
+
+	// Resource queries on CVP >v3 (on-prem) need to route through "<host>/api/...",
+	// but existing library endpoints do not.
+	var fullURL string
+	if strings.Contains(url, "/api/") || strings.Contains(url, "/cvpservice/") {
+		fullURL = c.urlPrefixShort + url
+	} else if c.IsCvaas {
+		// For CVaaS use cvpservice instead of web or api
+		fullURL = c.urlPrefixShort + "/cvpservice" + url
+	} else {
+		fullURL = c.urlPrefixShort + "/web" + url
 	}
 
 	retryCnt := NumRetryRequests
@@ -437,11 +469,11 @@ func (c *CvpClient) makeRequest(reqType string, url string, params *url.Values,
 		// Check reqType
 		switch reqType {
 		case "GET":
-			resp, err = request.Get(url)
+			resp, err = request.Get(fullURL)
 		case "POST":
-			resp, err = request.SetBody(data).Post(url)
+			resp, err = request.SetBody(data).Post(fullURL)
 		case "DELETE":
-			resp, err = request.SetBody(data).Delete(url)
+			resp, err = request.SetBody(data).Delete(fullURL)
 		default:
 			return nil, errors.Errorf("Invalid. Request type [%s] not implemented", reqType)
 		}
@@ -485,7 +517,8 @@ func (c *CvpClient) makeRequest(reqType string, url string, params *url.Values,
 		// client error
 		if status != http.StatusOK {
 			// retry another session
-			err = errors.Errorf("Status [%d]", status)
+			// Body is included as it is important for debugging resource APIs.
+			err = errors.Errorf("Status [%d], Body %s", status, string(resp.Body()))
 			continue
 		}
 		break
@@ -539,7 +572,6 @@ func checkResponse(resp *resty.Response) error {
 	if err := checkResponseStatus(resp); err != nil {
 		return errors.Wrap(err, "checkResponse")
 	}
-
 	var info cvpapi.ErrorResponse
 	if err := json.Unmarshal(resp.Body(), &info); err != nil {
 		return errors.Wrap(err, "checkResponse")

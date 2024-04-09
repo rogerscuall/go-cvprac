@@ -427,6 +427,113 @@ func (c CvpRestAPI) SaveTopology() (*TaskInfo, error) {
 	return &resp.Data, nil
 }
 
+// configletAndBuilderKeyNames helper struct for the quadtuple of configlet keys, names and
+// configletBuilder keys, names.
+type configletAndBuilderKeyNames struct {
+	keys,
+	names,
+	bKeys,
+	bNames []string
+}
+
+func (c *configletAndBuilderKeyNames) Equals(other *configletAndBuilderKeyNames) bool {
+	if len(c.keys) != len(other.keys) || len(c.bKeys) != len(other.bKeys) {
+		return false
+	}
+
+	for i, v := range c.keys {
+		if v != other.keys[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func changesNeeded(applied, configlets []Configlet) (
+	*configletAndBuilderKeyNames, *configletAndBuilderKeyNames, error,
+) {
+	// configlets to set
+	configletAndBuilders, err := splitToConfigletAndBuilder(configlets)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rmConfiglets := configletDifference(applied, configlets)
+
+	rmConfigletAndBuilders, err := splitToConfigletAndBuilder(rmConfiglets)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &configletAndBuilders, &rmConfigletAndBuilders, nil
+}
+
+// SetConfigletsToDevice Sets the configlets to the device,
+// and removes configlets from the device not referenced in `configlets`.
+func (c CvpRestAPI) SetConfigletsToDevice(appName string, dev *NetElement, commit bool,
+	configlets ...Configlet) (*TaskInfo, error) {
+	if dev == nil {
+		return nil, errors.Errorf("SetConfigletsToDevice: nil NetElement")
+	}
+
+	// configlets to be removed; applied minus not in configlets
+	currentConfiglets, err := c.GetConfigletsByDeviceID(dev.SystemMacAddress)
+	if err != nil {
+		return nil, errors.Errorf("ApplyConfigletsToDevice: %s", err)
+	}
+
+	newCAndB, rmCAndB, err := changesNeeded(currentConfiglets, configlets)
+	if err != nil {
+		return nil, err
+	}
+
+	info := appName + ": Configlet Assign: to Device " + dev.Fqdn
+	infoPreview := "<b>Configlet Assign:</b> to Device" + dev.Fqdn
+
+	data := struct {
+		Data []Action `json:"data,omitempty"`
+	}{Data: []Action{
+		{
+			ID:                              1,
+			Info:                            info,
+			InfoPreview:                     infoPreview,
+			Note:                            "",
+			Action:                          "associate",
+			NodeType:                        "configlet",
+			NodeID:                          "",
+			ConfigletBuilderList:            newCAndB.bKeys,
+			ConfigletBuilderNamesList:       newCAndB.bNames,
+			ConfigletList:                   newCAndB.keys,
+			ConfigletNamesList:              newCAndB.names,
+			IgnoreConfigletBuilderNamesList: rmCAndB.bNames,
+			IgnoreConfigletBuilderList:      rmCAndB.bKeys,
+			IgnoreConfigletNamesList:        rmCAndB.names,
+			IgnoreConfigletList:             rmCAndB.keys,
+			ToID:                            dev.SystemMacAddress,
+			ToIDType:                        "netelement",
+			FromID:                          "",
+			NodeIPAddress:                   dev.IPAddress,
+			NodeName:                        "",
+			NodeTargetIPAddress:             dev.IPAddress,
+			FromName:                        "",
+			ToName:                          dev.Fqdn,
+			ChildTasks:                      []string{},
+			ParentTask:                      "",
+		},
+	}}
+
+	if err := c.addTempAction(data); err != nil {
+		return nil, errors.Errorf("SetConfigletsToDevice: %s", err)
+	}
+
+	if commit {
+		return c.SaveTopology()
+	}
+
+	return nil, nil
+}
+
 // ApplyConfigletsToDevice apply the configlets to the device.
 func (c CvpRestAPI) ApplyConfigletsToDevice(appName string, dev *NetElement, commit bool,
 	newConfiglets ...Configlet) (*TaskInfo, error) {
@@ -439,7 +546,7 @@ func (c CvpRestAPI) ApplyConfigletsToDevice(appName string, dev *NetElement, com
 		return nil, errors.Errorf("ApplyConfigletsToDevice: %s", err)
 	}
 
-	action, cnames, ckeys, cbnames, cbkeys, err := checkConfigMapping(configlets, newConfiglets)
+	action, configletAndBuilders, err := checkConfigMapping(configlets, newConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "ApplyConfigletsToDevice")
 	}
@@ -461,10 +568,10 @@ func (c CvpRestAPI) ApplyConfigletsToDevice(appName string, dev *NetElement, com
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletBuilderList:            cbkeys,
-			ConfigletBuilderNamesList:       cbnames,
-			ConfigletList:                   ckeys,
-			ConfigletNamesList:              cnames,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
 			IgnoreConfigletBuilderNamesList: []string{},
 			IgnoreConfigletBuilderList:      []string{},
 			IgnoreConfigletNamesList:        []string{},
@@ -543,7 +650,7 @@ func (c CvpRestAPI) ValidateAndApplyConfigletsToDevice(appName string, dev *NetE
 	if err != nil {
 		return nil, errors.Errorf("ApplyConfigletsToDevice: %s", err)
 	}
-	action, cnames, ckeys, cbnames, cbkeys, err := checkConfigMapping(configlets, newConfiglets)
+	action, configletAndBuilders, err := checkConfigMapping(configlets, newConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "ApplyConfigletsToDevice")
 	}
@@ -553,7 +660,8 @@ func (c CvpRestAPI) ValidateAndApplyConfigletsToDevice(appName string, dev *NetE
 	}
 
 	// Run Validation of new configlets to be applied
-	validateResp, err := c.ValidateConfigletsForDevice(dev.SystemMacAddress, ckeys)
+	validateResp, err := c.ValidateConfigletsForDevice(dev.SystemMacAddress,
+		configletAndBuilders.keys)
 	if err != nil {
 		return nil, errors.Errorf("ApplyConfigletsToDevice: %s", err)
 	}
@@ -582,10 +690,10 @@ func (c CvpRestAPI) ValidateAndApplyConfigletsToDevice(appName string, dev *NetE
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletBuilderList:            cbkeys,
-			ConfigletBuilderNamesList:       cbnames,
-			ConfigletList:                   ckeys,
-			ConfigletNamesList:              cnames,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
 			IgnoreConfigletBuilderNamesList: []string{},
 			IgnoreConfigletBuilderList:      []string{},
 			IgnoreConfigletNamesList:        []string{},
@@ -624,7 +732,7 @@ func (c CvpRestAPI) RemoveConfigletsFromDevice(appName string, dev *NetElement, 
 		return nil, errors.Errorf("RemoveConfigletsFromDevice: %s", err)
 	}
 
-	action, cNames, cbNames, rmNames, rmbNames, err :=
+	action, configletAndBuilders, rmConfigletAndBuilders, err :=
 		checkRemoveConfigMapping(configlets, remConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "RemoveConfigletsFromDevice")
@@ -632,27 +740,6 @@ func (c CvpRestAPI) RemoveConfigletsFromDevice(appName string, dev *NetElement, 
 
 	if !action {
 		return nil, nil
-	}
-
-	var cKeys, cbKeys, rmKeys, rmbKeys []string
-	// Build a list of the configlet names/keys to remove.
-	if cKeys, err = c.getConfigletKeys(cNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromDevice")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if cbKeys, err = c.getConfigletKeys(cbNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromDevice")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if rmKeys, err = c.getConfigletKeys(rmNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromDevice")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if rmbKeys, err = c.getConfigletKeys(rmbNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromDevice")
 	}
 
 	info := appName + ": Configlet Remove: from Device " + dev.Fqdn
@@ -669,14 +756,14 @@ func (c CvpRestAPI) RemoveConfigletsFromDevice(appName string, dev *NetElement, 
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletList:                   cKeys,
-			ConfigletNamesList:              cNames,
-			ConfigletBuilderList:            cbKeys,
-			ConfigletBuilderNamesList:       cbNames,
-			IgnoreConfigletList:             rmKeys,
-			IgnoreConfigletNamesList:        rmNames,
-			IgnoreConfigletBuilderList:      rmbKeys,
-			IgnoreConfigletBuilderNamesList: rmbNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			IgnoreConfigletList:             rmConfigletAndBuilders.keys,
+			IgnoreConfigletNamesList:        rmConfigletAndBuilders.names,
+			IgnoreConfigletBuilderList:      rmConfigletAndBuilders.bKeys,
+			IgnoreConfigletBuilderNamesList: rmConfigletAndBuilders.bNames,
 			ToID:                            dev.SystemMacAddress,
 			ToIDType:                        "netelement",
 			FromID:                          "",
@@ -781,7 +868,7 @@ func (c CvpRestAPI) ApplyConfigletsToContainer(appName string, cont *Container,
 		return nil, errors.Errorf("ApplyConfigletsToContainer: %s", err)
 	}
 
-	action, cnames, ckeys, cbnames, cbkeys, err := checkConfigMapping(configlets, newConfiglets)
+	action, configletAndBuilders, err := checkConfigMapping(configlets, newConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "ApplyConfigletsToContainer")
 	}
@@ -803,10 +890,10 @@ func (c CvpRestAPI) ApplyConfigletsToContainer(appName string, cont *Container,
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletBuilderList:            cbkeys,
-			ConfigletBuilderNamesList:       cbnames,
-			ConfigletList:                   ckeys,
-			ConfigletNamesList:              cnames,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
 			IgnoreConfigletBuilderNamesList: []string{},
 			IgnoreConfigletBuilderList:      []string{},
 			IgnoreConfigletNamesList:        []string{},
@@ -850,7 +937,7 @@ func (c CvpRestAPI) RemoveConfigletsFromContainer(appName string, cont *Containe
 		return nil, errors.Errorf("RemoveConfigletsFromContainer: %s", err)
 	}
 
-	action, cNames, cbNames, rmNames, rmbNames, err :=
+	action, configletAndBuilders, rmConfigletAndBuilders, err :=
 		checkRemoveConfigMapping(configlets, remConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "RemoveConfigletsFromContainer")
@@ -858,27 +945,6 @@ func (c CvpRestAPI) RemoveConfigletsFromContainer(appName string, cont *Containe
 
 	if !action {
 		return nil, nil
-	}
-
-	var cKeys, cbKeys, rmKeys, rmbKeys []string
-	// Build a list of the configlet names/keys to remove.
-	if cKeys, err = c.getConfigletKeys(cNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromContainer")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if cbKeys, err = c.getConfigletKeys(cbNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromContainer")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if rmKeys, err = c.getConfigletKeys(rmNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromContainer")
-	}
-
-	// Build a list of the configlet names/keys to remove.
-	if rmbKeys, err = c.getConfigletKeys(rmbNames); err != nil {
-		return nil, errors.Wrap(err, "RemoveConfigletsFromContainer")
 	}
 
 	info := appName + ": Configlet Remove: from Container " + cont.Name
@@ -895,14 +961,14 @@ func (c CvpRestAPI) RemoveConfigletsFromContainer(appName string, cont *Containe
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletList:                   cKeys,
-			ConfigletNamesList:              cNames,
-			ConfigletBuilderList:            cbKeys,
-			ConfigletBuilderNamesList:       cbNames,
-			IgnoreConfigletList:             rmKeys,
-			IgnoreConfigletNamesList:        rmNames,
-			IgnoreConfigletBuilderList:      rmbKeys,
-			IgnoreConfigletBuilderNamesList: rmbNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			IgnoreConfigletList:             rmConfigletAndBuilders.keys,
+			IgnoreConfigletNamesList:        rmConfigletAndBuilders.names,
+			IgnoreConfigletBuilderList:      rmConfigletAndBuilders.bKeys,
+			IgnoreConfigletBuilderNamesList: rmConfigletAndBuilders.bNames,
 			ToID:                            cont.Key,
 			ToIDType:                        "container",
 			FromID:                          "",
@@ -1529,7 +1595,7 @@ func (c CvpRestAPI) DeployDeviceWithImage(appName string, dev *NetElement, devTa
 		return nil, errors.Errorf("DeployDeviceWithImage: %s", err)
 	}
 
-	_, cnames, ckeys, cbnames, cbkeys, err := checkConfigMapping(curConfiglets,
+	_, configletAndBuilders, err := checkConfigMapping(curConfiglets,
 		applyConfiglets)
 	if err != nil {
 		return nil, errors.Wrap(err, "DeployDeviceWithImage")
@@ -1548,10 +1614,10 @@ func (c CvpRestAPI) DeployDeviceWithImage(appName string, dev *NetElement, devTa
 			Action:                          "associate",
 			NodeType:                        "configlet",
 			NodeID:                          "",
-			ConfigletBuilderList:            cbkeys,
-			ConfigletBuilderNamesList:       cbnames,
-			ConfigletList:                   ckeys,
-			ConfigletNamesList:              cnames,
+			ConfigletBuilderList:            configletAndBuilders.bKeys,
+			ConfigletBuilderNamesList:       configletAndBuilders.bNames,
+			ConfigletList:                   configletAndBuilders.keys,
+			ConfigletNamesList:              configletAndBuilders.names,
 			IgnoreConfigletBuilderNamesList: []string{},
 			IgnoreConfigletBuilderList:      []string{},
 			IgnoreConfigletNamesList:        []string{},
@@ -1781,145 +1847,127 @@ func (c CvpRestAPI) FilterTopology(nodeID, query string) (*Topology, error) {
 	return c.FilterTopologyWithRange(nodeID, query, "topology", 0, 0)
 }
 
+// configletUnion Do the set configletUnion of c1 and c2
+// elements not in c1, but are in c2 are appended to c1 and returned
+func configletUnion(c1, c2 []Configlet) []Configlet {
+	configletMap := make(map[string]string)
+	for _, configlet := range c1 {
+		configletMap[configlet.Key] = configlet.Name
+	}
+
+	for _, c := range c2 {
+		if _, found := configletMap[c.Key]; !found {
+			c1 = append(c1, c)
+		}
+	}
+
+	return c1
+}
+
+// configletDifference Do the set difference of c1 and c2.
+// Elements of c1 are returned only if they are not in c2.
+func configletDifference(c1, c2 []Configlet) []Configlet {
+	rmKeys := map[string]Configlet{}
+	for _, c := range c2 {
+		rmKeys[c.Key] = c
+	}
+
+	var configletsToRemain []Configlet
+
+	for _, c := range c1 {
+		if _, found := rmKeys[c.Key]; !found {
+			configletsToRemain = append(configletsToRemain, c)
+		}
+	}
+
+	return configletsToRemain
+}
+
 // checkConfigMapping Checks whether the new configlets to be applied are
 // already applied or not. Returns actionReqd ( bool ), configletMap,
 // and builderMap.
 func checkConfigMapping(applied []Configlet, newconfiglets []Configlet) (bool,
-	[]string, []string, []string, []string, error) {
-	var configletNames []string
-	var configletKeys []string
-	var builderNames []string
-	var builderKeys []string
-	var reconcileConfiglet *Configlet
+	configletAndBuilderKeyNames, error,
+) {
+	configlets := configletUnion(applied, newconfiglets)
 
-	configletMap := make(map[string]string)
+	configletAndBuilders, err := splitToConfigletAndBuilder(configlets)
+	if err != nil {
+		return false, configletAndBuilders, err
+	}
 
-	for _, configlet := range applied {
+	actionReqd := len(configlets) != len(applied)
+
+	return actionReqd, configletAndBuilders, nil
+}
+
+func splitToConfigletAndBuilder(configlets []Configlet) (configletAndBuilderKeyNames, error) {
+	var (
+		configletNames     []string
+		configletKeys      []string
+		builderNames       []string
+		builderKeys        []string
+		reconcileConfiglet *Configlet
+	)
+
+	for i, configlet := range configlets {
 		// Reconcile configlet must be last in the list
-		// Store it separatly to be appended at very end of current and new configlets
+		// Store it separately to be appended at very end of current and new configlets
 		if configlet.Reconciled {
-			reconcileConfiglet = &configlet
+			reconcileConfiglet = &configlets[i]
+
 			continue
 		}
 
 		switch configlet.Type {
-		case "Static":
-			fallthrough
-		case "Generated":
-			fallthrough
-		case "Reconciled":
+		case "Static", "Generated", "Reconciled":
 			configletNames = append(configletNames, configlet.Name)
 			configletKeys = append(configletKeys, configlet.Key)
+
 		case "Builder":
 			builderNames = append(builderNames, configlet.Name)
 			builderKeys = append(builderKeys, configlet.Key)
+
 		default:
-			return false, nil, nil, nil, nil,
-				errors.Errorf("Configlet [%s] Invalid Type [%s]", configlet.Name, configlet.Type)
-		}
-		configletMap[configlet.Key] = configlet.Name
-	}
-
-	var actionReqd bool
-	for _, configlet := range newconfiglets {
-		// don't process already applied configlets
-		if _, found := configletMap[configlet.Key]; found {
-			continue
-		}
-		// Reconcile configlet must be last in the list
-		// Store it separatly to be appended at very end of current and new configlets
-		if configlet.Reconciled {
-			reconcileConfiglet = &configlet
-			continue
-		}
-
-		// didn't find this configlet in either maps, so it's new
-		actionReqd = true
-
-		switch configlet.Type {
-		case "Static":
-			fallthrough
-		case "Generated":
-			fallthrough
-		case "Reconciled":
-			configletNames = append(configletNames, configlet.Name)
-			configletKeys = append(configletKeys, configlet.Key)
-		case "Builder":
-			builderNames = append(builderNames, configlet.Name)
-			builderKeys = append(builderKeys, configlet.Key)
-		default:
-			return false, nil, nil, nil, nil,
+			return configletAndBuilderKeyNames{},
 				errors.Errorf("Configlet [%s] Invalid Type [%s]", configlet.Name, configlet.Type)
 		}
 	}
 
-	// Tack reconcile configlet onto end of appropriate lists if found
+	// Add reconcileConfiglet as last in the list
 	if reconcileConfiglet != nil {
 		configletNames = append(configletNames, reconcileConfiglet.Name)
 		configletKeys = append(configletKeys, reconcileConfiglet.Key)
 	}
 
-	return actionReqd, configletNames, configletKeys, builderNames, builderKeys, nil
+	return configletAndBuilderKeyNames{
+		configletKeys,
+		configletNames,
+		builderKeys,
+		builderNames,
+	}, nil
 }
 
 // checkRemoveConfigMapping Creates map of configlets that needs to be there after removal of
 // specific configlets
 func checkRemoveConfigMapping(applied []Configlet, rmConfiglets []Configlet) (bool,
-	[]string, []string, []string, []string, error) {
-	var configletNames []string
-	var builderNames []string
-	var rmConfigletNames []string
-	var rmBuilderNames []string
+	configletAndBuilderKeyNames, configletAndBuilderKeyNames, error,
+) {
+	configletsToRemain := configletDifference(applied, rmConfiglets)
 
-	configletMap := make(map[string]string)
-
-	for _, configlet := range rmConfiglets {
-		switch configlet.Type {
-		case "Static":
-			fallthrough
-		case "Generated":
-			fallthrough
-		case "Reconciled":
-			rmConfigletNames = append(rmConfigletNames, configlet.Name)
-		case "Builder":
-			rmBuilderNames = append(rmBuilderNames, configlet.Name)
-		default:
-			return false, nil, nil, nil, nil,
-				errors.Errorf("Configlet [%s] Invalid Type [%s]", configlet.Name, configlet.Type)
-		}
-		configletMap[configlet.Key] = configlet.Name
+	rmConfigletAndBuilders, err := splitToConfigletAndBuilder(rmConfiglets)
+	if err != nil {
+		return false, configletAndBuilderKeyNames{}, configletAndBuilderKeyNames{}, err
 	}
 
-	var actionReqd bool
-	for _, configlet := range applied {
-		// don't process already processed configlets
-		if _, found := configletMap[configlet.Key]; found {
-			continue
-		}
-
-		// didn't find this configlet in either maps, so it's new
-		actionReqd = true
-
-		switch configlet.Type {
-		case "Static":
-			fallthrough
-		case "Generated":
-			fallthrough
-		case "Reconciled":
-			configletNames = append(configletNames, configlet.Name)
-		case "Builder":
-			builderNames = append(builderNames, configlet.Name)
-		default:
-			return false, nil, nil, nil, nil,
-				errors.Errorf("Configlet [%s] Invalid Type [%s]", configlet.Name, configlet.Type)
-		}
+	configletAndBuilders, err2 := splitToConfigletAndBuilder(configletsToRemain)
+	if err2 != nil {
+		return false, configletAndBuilderKeyNames{}, configletAndBuilderKeyNames{}, err2
 	}
 
-	if len(configletNames) == 0 && len(builderNames) == 0 {
-		actionReqd = true
-	}
+	actionReqd := len(configletsToRemain) != len(applied)
 
-	return actionReqd, configletNames, builderNames, rmConfigletNames, rmBuilderNames, nil
+	return actionReqd, configletAndBuilders, rmConfigletAndBuilders, nil
 }
 
 func (c CvpRestAPI) getConfigletKeys(configletNames []string) ([]string, error) {
